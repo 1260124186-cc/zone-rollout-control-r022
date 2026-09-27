@@ -130,70 +130,43 @@ func BuildAssessment(
 	}
 }
 
+// ReconcileLeaseOwnership recovers nodes whose own leases no longer hold them.
+// A node stays leased only while one of its own leases is still claimed and
+// unexpired; every other leased node returns to ready. Lease states are never
+// changed here, so a terminal lease is never reactivated and one lease ending
+// never frees the sibling nodes of its allocation group.
 func ReconcileLeaseOwnership(state *State, now time.Time) int {
 	if state == nil {
 		return 0
 	}
-	groups := make(map[string][]NodeLease)
+	occupied := make(map[string]struct{})
 	for _, lease := range state.Leases {
-		if lease.AllocationID == "" {
+		if lease.State != LeaseClaimed || !lease.ExpiresAt.After(now) {
 			continue
 		}
-		groups[lease.AllocationID] = append(groups[lease.AllocationID], lease)
+		occupied[lease.NodeID] = struct{}{}
 	}
-	groupIDs := make([]string, 0, len(groups))
-	for groupID := range groups {
-		groupIDs = append(groupIDs, groupID)
+	nodeIDs := make([]string, 0, len(state.Nodes))
+	for nodeID := range state.Nodes {
+		nodeIDs = append(nodeIDs, nodeID)
 	}
-	sort.Strings(groupIDs)
+	sort.Strings(nodeIDs)
 	recovered := 0
-	for _, groupID := range groupIDs {
-		leases := groups[groupID]
-		if !leaseGroupHasTerminalLease(leases) {
+	for _, nodeID := range nodeIDs {
+		node := state.Nodes[nodeID]
+		if node.State != NodeLeased {
 			continue
 		}
-		recovered += releaseLeaseGroupNodes(state, leases, leaseGroupRecoveryTime(leases, now))
-	}
-	return recovered
-}
-
-func leaseGroupHasTerminalLease(leases []NodeLease) bool {
-	for _, lease := range leases {
-		if lease.State == LeaseReleased || lease.State == LeaseExpired {
-			return true
-		}
-	}
-	return false
-}
-
-func leaseGroupRecoveryTime(leases []NodeLease, fallback time.Time) time.Time {
-	recoveryTime := fallback.UTC()
-	for _, lease := range leases {
-		if lease.FinishedAt == nil {
-			continue
-		}
-		finishedAt := lease.FinishedAt.UTC()
-		if finishedAt.After(recoveryTime) || recoveryTime.IsZero() {
-			recoveryTime = finishedAt
-		}
-	}
-	return recoveryTime
-}
-
-func releaseLeaseGroupNodes(state *State, leases []NodeLease, at time.Time) int {
-	released := 0
-	for _, lease := range leases {
-		node, ok := state.Nodes[lease.NodeID]
-		if !ok || node.State != NodeLeased {
+		if _, held := occupied[nodeID]; held {
 			continue
 		}
 		node.State = NodeReady
 		node.Version++
-		node.UpdatedAt = at.UTC()
-		state.Nodes[node.ID] = node
-		released++
+		node.UpdatedAt = now.UTC()
+		state.Nodes[nodeID] = node
+		recovered++
 	}
-	return released
+	return recovered
 }
 
 func round(value float64, places int) float64 {
