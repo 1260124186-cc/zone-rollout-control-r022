@@ -130,70 +130,57 @@ func BuildAssessment(
 	}
 }
 
+// ActiveLeaseOccupancy reports which nodes are bound to leases that are
+// still actively claimed: a node is occupied only while one of its own
+// leases remains claimed and unexpired. Ending one lease never affects the
+// nodes bound to sibling leases from the same allocation batch.
+func ActiveLeaseOccupancy(state *State, now time.Time) map[string]bool {
+	occupied := make(map[string]bool)
+	if state == nil {
+		return occupied
+	}
+	now = now.UTC()
+	for _, lease := range state.Leases {
+		if lease.State != LeaseClaimed || !lease.ExpiresAt.After(now) {
+			continue
+		}
+		occupied[lease.NodeID] = true
+	}
+	return occupied
+}
+
+// ReconcileLeaseOwnership aligns node occupancy with the leases that are
+// still actively claimed. Lease states are facts and are never mutated
+// here, so a lease that already ended cannot be reactivated by
+// reconciliation.
 func ReconcileLeaseOwnership(state *State, now time.Time) int {
 	if state == nil {
 		return 0
 	}
-	groups := make(map[string][]NodeLease)
-	for _, lease := range state.Leases {
-		if lease.AllocationID == "" {
+	now = now.UTC()
+	occupied := ActiveLeaseOccupancy(state, now)
+	nodeIDs := make([]string, 0, len(state.Nodes))
+	for nodeID := range state.Nodes {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+	reconciled := 0
+	for _, nodeID := range nodeIDs {
+		node := state.Nodes[nodeID]
+		switch {
+		case node.State == NodeLeased && !occupied[nodeID]:
+			node.State = NodeReady
+		case node.State == NodeReady && occupied[nodeID]:
+			node.State = NodeLeased
+		default:
 			continue
 		}
-		groups[lease.AllocationID] = append(groups[lease.AllocationID], lease)
-	}
-	groupIDs := make([]string, 0, len(groups))
-	for groupID := range groups {
-		groupIDs = append(groupIDs, groupID)
-	}
-	sort.Strings(groupIDs)
-	recovered := 0
-	for _, groupID := range groupIDs {
-		leases := groups[groupID]
-		if !leaseGroupHasTerminalLease(leases) {
-			continue
-		}
-		recovered += releaseLeaseGroupNodes(state, leases, leaseGroupRecoveryTime(leases, now))
-	}
-	return recovered
-}
-
-func leaseGroupHasTerminalLease(leases []NodeLease) bool {
-	for _, lease := range leases {
-		if lease.State == LeaseReleased || lease.State == LeaseExpired {
-			return true
-		}
-	}
-	return false
-}
-
-func leaseGroupRecoveryTime(leases []NodeLease, fallback time.Time) time.Time {
-	recoveryTime := fallback.UTC()
-	for _, lease := range leases {
-		if lease.FinishedAt == nil {
-			continue
-		}
-		finishedAt := lease.FinishedAt.UTC()
-		if finishedAt.After(recoveryTime) || recoveryTime.IsZero() {
-			recoveryTime = finishedAt
-		}
-	}
-	return recoveryTime
-}
-
-func releaseLeaseGroupNodes(state *State, leases []NodeLease, at time.Time) int {
-	released := 0
-	for _, lease := range leases {
-		node, ok := state.Nodes[lease.NodeID]
-		if !ok || node.State != NodeLeased {
-			continue
-		}
-		node.State = NodeReady
 		node.Version++
-		node.UpdatedAt = at.UTC()
-		state.Nodes[node.ID] = node
-		released++
+		node.UpdatedAt = now
+		state.Nodes[nodeID] = node
+		reconciled++
 	}
-	return released
+	return reconciled
 }
 
 func round(value float64, places int) float64 {

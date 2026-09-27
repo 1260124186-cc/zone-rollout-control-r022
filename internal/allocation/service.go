@@ -63,9 +63,11 @@ func (s *Service) Allocate(
 		}
 
 		expireLeases(state, now)
+		domain.ReconcileLeaseOwnership(state, now)
+		occupied := domain.ActiveLeaseOccupancy(state, now)
 		candidates := make([]domain.ResolverNode, 0)
 		for _, node := range state.Nodes {
-			if node.State != domain.NodeReady {
+			if node.State != domain.NodeReady || occupied[node.ID] {
 				continue
 			}
 			if input.Region != "" && node.Region != input.Region {
@@ -147,8 +149,7 @@ func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease
 				"state":    lease.State,
 			})
 		}
-		node, ok := state.Nodes[lease.NodeID]
-		if !ok {
+		if _, ok := state.Nodes[lease.NodeID]; !ok {
 			return domain.NewError(domain.CodeStorageFailure, "lease references a missing node", map[string]any{
 				"node_id": lease.NodeID,
 			})
@@ -157,12 +158,6 @@ func (s *Service) Release(ctx context.Context, leaseID string) (domain.NodeLease
 		lease.State = domain.LeaseReleased
 		lease.FinishedAt = &finishedAt
 		state.Leases[leaseID] = lease
-		if node.State == domain.NodeLeased {
-			node.State = domain.NodeReady
-			node.Version++
-			node.UpdatedAt = now
-			state.Nodes[node.ID] = node
-		}
 		domain.ReconcileLeaseOwnership(state, now)
 		store.AddAudit(state, s.ids, "lease", leaseID, "released", now, nil)
 		result = lease
@@ -176,6 +171,7 @@ func (s *Service) ExpireDue(ctx context.Context) (int, error) {
 	expired := 0
 	err := s.store.Write(ctx, func(state *domain.State) error {
 		expired = expireLeases(state, now)
+		domain.ReconcileLeaseOwnership(state, now)
 		return nil
 	})
 	return expired, err
@@ -191,16 +187,7 @@ func expireLeases(state *domain.State, now time.Time) int {
 		lease.State = domain.LeaseExpired
 		lease.FinishedAt = &finishedAt
 		state.Leases[leaseID] = lease
-		if node, ok := state.Nodes[lease.NodeID]; ok && node.State == domain.NodeLeased {
-			node.State = domain.NodeReady
-			node.Version++
-			node.UpdatedAt = now
-			state.Nodes[node.ID] = node
-		}
 		count++
-	}
-	if count > 0 {
-		domain.ReconcileLeaseOwnership(state, now)
 	}
 	return count
 }
